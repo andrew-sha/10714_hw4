@@ -186,6 +186,12 @@ class TensorTuple(Value):
         assert len(self) == len(other)
         return needle.ops.make_tuple(*[self[i] + other[i] for i in range(len(self))])
 
+    # Allow Python built-in sum() to work with start=0
+    def __radd__(self, other):
+        if other == 0:
+            return self
+        return self.__add__(other)
+
     def detach(self):
         """Create a new tensor that shares the data but detaches from the graph."""
         return TensorTuple.make_const(self.realize_cached_data())
@@ -216,7 +222,7 @@ class Tensor(Value):
                     array.numpy(), device=device, dtype=dtype
                 )
         else:
-            device = device if device else default_device()
+            device = device if device else cpu()
             cached_data = Tensor._array_from_numpy(array, device=device, dtype=dtype)
 
         self._init(
@@ -359,9 +365,6 @@ class Tensor(Value):
     def transpose(self, axes=None):
         return needle.ops.Transpose(axes)(self)
 
-
-
-
     __radd__ = __add__
     __rmul__ = __mul__
 
@@ -380,9 +383,18 @@ def compute_gradient_of_variables(output_tensor, out_grad):
     # Traverse graph in reverse topological order given the output_node that we are taking gradient wrt.
     reverse_topo_order = list(reversed(find_topo_sort([output_tensor])))
 
-    ### BEGIN YOUR SOLUTION
-    raise NotImplementedError()
-    ### END YOUR SOLUTION
+    for node in reverse_topo_order:
+      adjoint = sum(node_to_output_grads_list[node])
+      node.grad = adjoint
+
+      for idx, ip in enumerate(node.inputs):
+          if ip not in node_to_output_grads_list:
+              node_to_output_grads_list[ip] = []
+            
+          partial_adjoint = node.op.gradient(adjoint, node)
+          if not isinstance(partial_adjoint, tuple):
+              partial_adjoint = [partial_adjoint]
+          node_to_output_grads_list[ip].append(partial_adjoint[idx])
 
 
 def find_topo_sort(node_list: List[Value]) -> List[Value]:
@@ -393,16 +405,24 @@ def find_topo_sort(node_list: List[Value]) -> List[Value]:
     after all its predecessors are traversed due to post-order DFS, we get a topological
     sort.
     """
-    ### BEGIN YOUR SOLUTION
-    raise NotImplementedError()
-    ### END YOUR SOLUTION
+    topo_order = []
+    visited = set() # stores id(node) if it was already visited
+
+    for node in node_list:
+      if id(node) not in visited:
+        topo_sort_dfs(node, visited, topo_order)
+
+    return topo_order
 
 
 def topo_sort_dfs(node, visited, topo_order):
     """Post-order DFS"""
-    ### BEGIN YOUR SOLUTION
-    raise NotImplementedError()
-    ### END YOUR SOLUTION
+    for child in node.inputs:
+      if id(child) not in visited:
+        topo_sort_dfs(child, visited, topo_order)
+    
+    visited.add(id(node))
+    topo_order.append(node)
 
 
 ##############################
