@@ -24,9 +24,11 @@ class SGD(Optimizer):
         self.weight_decay = weight_decay
 
     def step(self):
-        ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
-        ### END YOUR SOLUTION
+        for idx, param in enumerate(self.params):
+          g = param.grad.data + self.weight_decay * param.data
+          new_u = self.momentum * self.u.get(param, 0.0*g) + (1.0-self.momentum) * g
+          param.data = param.data - self.lr * new_u
+          self.u[param] = new_u
 
     def clip_grad_norm(self, max_norm=0.25):
         """
@@ -60,6 +62,16 @@ class Adam(Optimizer):
         self.v = {}
 
     def step(self):
-        ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
-        ### END YOUR SOLUTION
+      self.t += 1
+      for param in self.params:
+        g = param.grad.data + self.weight_decay * param.data
+
+        u_new = self.beta1 * self.m.get(param, 0.0) + (1.0-self.beta1) * g
+        v_new = self.beta2 * self.v.get(param, 0.0) + (1.0-self.beta2) * (g * g)
+        u_new_corrected = u_new.data / (1.0-(self.beta1**self.t))
+        v_new_corrected = v_new.data / (1.0-(self.beta2**self.t))
+        
+        param.data = param.data - ((self.lr * u_new_corrected) / (v_new_corrected.data**.5 + self.eps))
+
+        self.m[param] = u_new
+        self.v[param] = v_new

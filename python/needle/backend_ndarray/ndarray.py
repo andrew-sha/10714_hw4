@@ -632,9 +632,22 @@ class NDArray:
         Flip this ndarray along the specified axes.
         Note: compact() before returning.
         """
-        ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
-        ### END YOUR SOLUTION
+        # Implement by creating a view with negative strides along the axes
+        # and adjusting the offset to the last element along those axes.
+        if axes is None or len(axes) == 0:
+            return self.compact()
+
+        # Normalize axes to positive indices
+        norm_axes = tuple([ax % self.ndim for ax in axes])
+
+        new_strides = list(self._strides)
+        new_offset = self._offset
+        for ax in norm_axes:
+            new_offset += self._strides[ax] * (self.shape[ax] - 1)
+            new_strides[ax] = -new_strides[ax]
+
+        view = NDArray.make(self.shape, strides=tuple(new_strides), device=self.device, handle=self._handle, offset=new_offset)
+        return view.compact()
 
     def pad(self, axes: tuple[tuple[int, int], ...]) -> "NDArray":
         """
@@ -642,9 +655,25 @@ class NDArray:
         which lists for _all_ axes the left and right padding amount, e.g.,
         axes = ( (0, 0), (1, 1), (0, 0)) pads the middle axis with a 0 on the left and right side.
         """
-        ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
-        ### END YOUR SOLUTION
+        assert len(axes) == self.ndim, "axes must specify padding for all dimensions"
+
+        # Compute new shape after padding
+        new_shape = tuple(
+            self.shape[i] + int(axes[i][0]) + int(axes[i][1]) for i in range(self.ndim)
+        )
+
+        # Create output filled with zeros
+        out = NDArray.make(new_shape, device=self.device)
+        out.fill(0.0)
+
+        # Build slices to place the original array within the padded output
+        insert_slices = []
+        for i in range(self.ndim):
+            left = int(axes[i][0])
+            insert_slices.append(slice(left, left + self.shape[i], 1))
+
+        out[tuple(insert_slices)] = self
+        return out
 
 def array(a: Any, dtype: str = "float32", device: BackendDevice | None = None) -> NDArray:
     """Convenience methods to match numpy a bit more closely."""

@@ -47,6 +47,16 @@ class EWiseMul(TensorOp):
         return a * b
 
     def gradient(self, out_grad: Tensor, node: Tensor):
+        X, Y = node.inputs
+        target_device = Y.device
+        if out_grad.device != target_device:
+            out_grad = Tensor(out_grad.numpy(), device=target_device, requires_grad=False)
+        if X.device != target_device:
+            X = Tensor(X.numpy(), device=target_device, requires_grad=X.requires_grad)
+        if Y.device != target_device:
+            Y = Tensor(Y.numpy(), device=target_device, requires_grad=Y.requires_grad)
+        
+        
         lhs, rhs = node.inputs
         return out_grad * rhs, out_grad * lhs
 
@@ -196,15 +206,11 @@ class BroadcastTo(TensorOp):
     def compute(self, a):
         return a.broadcast_to(self.shape)
 
-
     def gradient(self, out_grad, node):
         original_shape = node.inputs[0].shape
         padded_shape = ([1] * (len(self.shape) - len(original_shape))) + list(original_shape)
-        
         reduced_axes = [dim for dim, size in enumerate(padded_shape) if size == 1 and self.shape[dim] > 1]
-
         return reshape(summation(out_grad, tuple(reduced_axes)), original_shape)
-
 
 def broadcast_to(a, shape):
     return BroadcastTo(shape)(a)
@@ -215,7 +221,24 @@ class Summation(TensorOp):
         self.axes = axes
 
     def compute(self, a):
-        return a.sum(self.axes)
+        axes = self.axes
+        # Direct full reduction
+        if axes is None:
+            return a.sum(None)
+        # Empty tuple/list => no-op
+        if isinstance(axes, (tuple, list)) and len(axes) == 0:
+            return a
+        # Normalize to list of axes
+        if isinstance(axes, int):
+            norm_axes = [axes % len(a.shape)]
+        else:
+            norm_axes = [ax % len(a.shape) for ax in axes]
+        # Reduce along multiple axes by chaining single-axis sums.
+        # Sum higher axes first to avoid index shifts after dimension removal.
+        out = a
+        for ax in sorted(norm_axes, reverse=True):
+            out = out.sum(ax)
+        return out
 
     def gradient(self, out_grad, node):
         x = node.inputs[0]
@@ -255,7 +278,16 @@ class MatMul(TensorOp):
 
     def gradient(self, out_grad, node):
         X, Y = node.inputs
-        dX, dY = matmul(out_grad, transpose(Y)), matmul(transpose(X), out_grad)
+        target_device = Y.device
+        if out_grad.device != target_device:
+            out_grad = Tensor(out_grad.numpy(), device=target_device, requires_grad=False)
+        if X.device != target_device:
+            X = Tensor(X.numpy(), device=target_device, requires_grad=X.requires_grad)
+        if Y.device != target_device:
+            Y = Tensor(Y.numpy(), device=target_device, requires_grad=Y.requires_grad)
+
+        dX = matmul(out_grad, transpose(Y))
+        dY = matmul(transpose(X), out_grad)
 
         padded_shape_X = ([1] * (len(dX.shape) - len(X.shape))) + list(X.shape)
         padded_shape_Y = ([1] * (len(dY.shape) - len(Y.shape))) + list(Y.shape)
@@ -393,6 +425,8 @@ class Split(TensorTupleOp):
 
     def compute(self, A):
         # Produce a tuple of NDArray by slicing along axis and removing that dimension
+        # IMPORTANT: Avoid reshape on non-compact views (would assume contiguous strides)
+        # Instead, create a strided view that "squeezes" the split axis by dropping it.
         axis = self.axis % len(A.shape)
         k = A.shape[axis]
         pre = A.shape[:axis]
@@ -400,8 +434,13 @@ class Split(TensorTupleOp):
         out = []
         for i in range(k):
             index = [slice(None)] * axis + [i] + [slice(None)] * (len(A.shape) - axis - 1)
-            view = A[tuple(index)]
-            out.append(view.reshape(tuple(list(pre) + list(post))))
+            view = A[tuple(index)]  # shape: pre + (1,) + post; strides preserved
+            # Build squeezed shape/strides by dropping the size-1 axis
+            new_shape = tuple(list(pre) + list(post))
+            v_strides = list(view.strides)
+            # view has len = len(pre) + 1 + len(post); drop the stride at the size-1 axis
+            new_strides = tuple(v_strides[:axis] + v_strides[axis + 1 :])
+            out.append(view.as_strided(new_shape, new_strides))
         return tuple(out)
 
     def gradient(self, out_grad, node):
@@ -418,14 +457,10 @@ class Flip(TensorOp):
         self.axes = axes
 
     def compute(self, a):
-        ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
-        ### END YOUR SOLUTION
+        return a.flip(self.axes)
 
     def gradient(self, out_grad, node):
-        ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
-        ### END YOUR SOLUTION
+        return flip(out_grad, self.axes)
 
 
 def flip(a, axes):
@@ -438,14 +473,42 @@ class Dilate(TensorOp):
         self.dilation = dilation
 
     def compute(self, a):
-        ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
-        ### END YOUR SOLUTION
+        d = int(self.dilation)
+        if d == 0 or self.axes is None or len(self.axes) == 0:
+            return a
+
+        # Normalize axes: keep only valid dims; map negatives; drop duplicates
+        ndim = len(a.shape)
+        valid_axes = []
+        for ax in self.axes:
+            if -ndim <= ax < ndim:
+                axn = ax if ax >= 0 else ax + ndim
+                if axn not in valid_axes:
+                    valid_axes.append(axn)
+        if not valid_axes:
+            return a
+
+        # Compute output shape: multiply specified axes by (d+1)
+        out_shape = list(a.shape)
+        for ax in valid_axes:
+            out_shape[ax] = out_shape[ax] * (d + 1)
+
+        out = a.make(tuple(out_shape), device=a.device)
+        out.fill(0.0)
+
+        # Build slice to place original values at strides (d+1)
+        index = []
+        for i in range(len(out_shape)):
+            if i in valid_axes:
+                index.append(slice(0, out_shape[i], d + 1))
+            else:
+                index.append(slice(0, out_shape[i], 1))
+
+        out[tuple(index)] = a
+        return out
 
     def gradient(self, out_grad, node):
-        ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
-        ### END YOUR SOLUTION
+        return undilate(out_grad, self.axes, self.dilation)
 
 
 def dilate(a, axes, dilation):
@@ -458,14 +521,30 @@ class UnDilate(TensorOp):
         self.dilation = dilation
 
     def compute(self, a):
-        ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
-        ### END YOUR SOLUTION
+        d = int(self.dilation)
+        if d == 0 or self.axes is None or len(self.axes) == 0:
+            return a
+        ndim = len(a.shape)
+        valid_axes = []
+        for ax in self.axes:
+            if -ndim <= ax < ndim:
+                axn = ax if ax >= 0 else ax + ndim
+                if axn not in valid_axes:
+                    valid_axes.append(axn)
+        if not valid_axes:
+            return a
+        # Build slicing view to take every (d+1)-th element along specified axes
+        index = []
+        for i, size in enumerate(a.shape):
+            if i in valid_axes:
+                index.append(slice(0, size, d + 1))
+            else:
+                index.append(slice(0, size, 1))
+        return a[tuple(index)]
 
     def gradient(self, out_grad, node):
-        ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
-        ### END YOUR SOLUTION
+        # Gradient inserts zeros between elements on the same axes
+        return dilate(out_grad, self.axes, self.dilation)
 
 
 def undilate(a, axes, dilation):
@@ -478,14 +557,92 @@ class Conv(TensorOp):
         self.padding = padding
 
     def compute(self, A, B):
-        ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
-        ### END YOUR SOLUTION
+        # A: (N, H, W, Cin) NHWC
+        # B: (K, K, Cin, Cout)
+        N, H, W, Cin = A.shape
+        K, K2, Cin_w, Cout = B.shape
+        assert K == K2 and Cin == Cin_w, "Kernel must be square and Cin must match"
+
+        s = int(self.stride)
+        p = int(self.padding)
+
+        # Pad input on spatial dimensions if needed
+        if p > 0:
+            A_pad = A.pad(((0, 0), (p, p), (p, p), (0, 0)))
+        else:
+            A_pad = A
+
+        Hp, Wp = A_pad.shape[1], A_pad.shape[2]
+        H_out = (Hp - K) // s + 1
+        W_out = (Wp - K) // s + 1
+
+        # im2col: (N*H_out*W_out, K*K*Cin)
+        X_col = A.make((N * H_out * W_out, K * K * Cin), device=A.device)
+
+        col = 0
+        for i in range(K):
+            for j in range(K):
+                patch = A_pad[:, i:i + H_out * s:s, j:j + W_out * s:s, :]  # (N, H_out, W_out, Cin)
+                patch_flat = patch.compact().reshape((N * H_out * W_out, Cin))
+                X_col[:, col * Cin:(col + 1) * Cin] = patch_flat
+                col += 1
+
+        W_col = B.compact().reshape((K * K * Cin, Cout))
+        Y_col = X_col @ W_col  # (N*H_out*W_out, Cout)
+        Y = Y_col.reshape((N, H_out, W_out, Cout))
+        return Y
 
     def gradient(self, out_grad, node):
-        ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
-        ### END YOUR SOLUTION
+        # Inputs
+        X, W = node.inputs  # Tensors
+        N, H, W_in, Cin = X.shape
+        K, _, Cin_w, Cout = W.shape
+        s = int(self.stride)
+        p = int(self.padding)
+
+        # dX: conv of dilated out_grad with flipped and channel-swapped weights
+        if s > 1:
+            og = dilate(out_grad, axes=(1, 2), dilation=s - 1)
+        else:
+            og = out_grad
+
+        W_t = transpose(W)              # swap Cin and Cout -> (K,K,Cout,Cin)
+        W_flip = flip(W_t, axes=(0, 1)) # flip spatial dims
+
+        pad_in = K - 1 - p
+        if pad_in < 0:
+            pad_in = 0  # assume no negative padding in our implementation domain
+        dX = conv(og, W_flip, stride=1, padding=pad_in)
+
+        # dW: use im2col on NDArray level
+        X_nd = X.realize_cached_data()
+        og_nd = out_grad.realize_cached_data()
+
+        # Pad input X on spatial dims
+        if p > 0:
+            Xp = X_nd.pad(((0, 0), (p, p), (p, p), (0, 0)))
+        else:
+            Xp = X_nd
+
+        Nn, Hp, Wp, Cin2 = Xp.shape
+        H_out = (Hp - K) // s + 1
+        W_out = (Wp - K) // s + 1
+
+        # Build im2col for Xp
+        X_col = X_nd.make((Nn * H_out * W_out, K * K * Cin2), device=Xp.device)
+        col = 0
+        for i in range(K):
+            for j in range(K):
+                patch = Xp[:, i:i + H_out * s:s, j:j + W_out * s:s, :]  # (N, H_out, W_out, Cin)
+                X_col[:, col * Cin2:(col + 1) * Cin2] = patch.compact().reshape((Nn * H_out * W_out, Cin2))
+                col += 1
+
+        G_col = og_nd.reshape((Nn * H_out * W_out, Cout))
+        dW_col = (X_col.permute((1, 0)) @ G_col)  # (K*K*Cin, Cout)
+        dW_nd = dW_col.reshape((K, K, Cin2, Cout))
+
+        dW = Tensor(dW_nd, dtype="float32")
+        return dX, dW
 
 
 def conv(a, b, stride=1, padding=1):
